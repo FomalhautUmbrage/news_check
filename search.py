@@ -1,60 +1,90 @@
 import numpy as np
 from sentence_transformers import SentenceTransformer
 import faiss
-
+import requests
+from bs4 import BeautifulSoup
+import json
 
 # 初始化模型和向量存储
 def initialize_system():
-    # 加载预训练模型（轻量且高效）
     model = SentenceTransformer('all-MiniLM-L6-v2')
-    # 创建 FAISS 索引，维度为 384（由模型决定）
-    index = faiss.IndexFlatL2(384)
+    index = faiss.IndexFlatL2(384)  # 向量维度为384
     return model, index
 
+# 抓取新闻内容
+def fetch_news_content(url):
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        paragraphs = soup.find_all('p')
+        return ' '.join([p.get_text() for p in paragraphs])
+    except Exception as e:
+        print(f"无法提取 {url}: {e}")
+        return ""
 
-# 添加网页内容到向量存储
-def add_webpages_to_store(model, index, webpages):
-    # 将网页内容转换为向量
-    vectors = model.encode(webpages)
-    # 添加到 FAISS 索引
-    index.add(np.array(vectors))
-    return webpages
+# 将新闻添加到向量存储
+def add_webpages_to_store(model, index, urls):
+    contents = [fetch_news_content(url) for url in urls]
+    vectors = model.encode([c for c in contents if c])  # 仅编码非空内容
+    if vectors.size > 0:
+        index.add(np.array(vectors))
+    return contents
 
+# 将查询转换为向量
+def encode_query(model, query):
+    return model.encode([query])[0]
 
 # 执行搜索
-def perform_search(query, model, index, webpages, k=5):
-    # 将查询转换为向量
-    query_vector = model.encode([query])[0]
-    # 在索引中搜索最相似的 k 个结果
-    D, I = index.search(np.array([query_vector]), k)
-    # 返回对应的网页内容
-    return [webpages[i] for i in I[0]]
+def perform_search(index, query_vector, k=5):
+    D, I = index.search(np.array([query_vector]), min(k, index.ntotal))
+    return I[0]
 
+# 使用本地DeepSeek模型判断真实性
+def check_authenticity(content, query):
+    try:
+        prompt = f"请判断以下新闻内容的真实性，查询是: '{query}'\n内容: {content[:1000]}"
+        url = "http://localhost:11435/api/generate"
+        payload = {
+            "model": "deepseek-r1:7b",
+            "prompt": prompt,
+            "max_tokens": 150,
+            "stream": False
+        }
+        response = requests.post(url, json=payload)
+        if response.status_code == 200:
+            print(f"API Raw Response: {response.text}")
+            lines = response.text.strip().split('\n')
+            full_text = ""
+            for line in lines:
+                if line:
+                    try:
+                        data = json.loads(line)
+                        full_text += data.get("response", data.get("text", ""))
+                    except json.JSONDecodeError as e:
+                        print(f"JSON 解析错误: {e} 在行: {line}")
+            return full_text or "无有效响应内容"
+        else:
+            return f"真实性判断失败: {response.status_code} - {response.text}"
+    except Exception as e:
+        return f"真实性判断失败: {e}"
+
+# 主函数
+def main(urls):
+    model, index = initialize_system()
+    contents = add_webpages_to_store(model, index, urls)
+    query = input("请输入您的查询: ")
+    query_vector = encode_query(model, query)
+    indices = perform_search(index, query_vector)
+    print("搜索结果：")
+    for i, idx in enumerate(indices, 1):
+        content = contents[idx]
+        authenticity = check_authenticity(content, query)
+        print(f"{i}. {content[:100] if content else '无内容'}...\n真实性判断: {authenticity}\n")
 
 # 示例使用
 if __name__ == "__main__":
-    # 初始化系统
-    model, index = initialize_system()
-
-    # 模拟全网数据（示例网页内容）
-    webpages = [
-        "Python 是一种流行的编程语言。",
-        "机器学习是人工智能的一个子集。",
-        "Web 开发涉及创建网站和应用程序。",
-        "数据科学结合统计学和计算机科学从数据中提取洞察。",
-        "云计算提供按需访问的计算资源。"
+    urls = [
+        "https://www.bbc.com/news/war-in-ukraine"
     ]
-
-    # 将网页内容添加到向量存储
-    webpages = add_webpages_to_store(model, index, webpages)
-
-    # 用户查询
-    query = "机器学习是什么？"
-
-    # 执行搜索并返回结果
-    results = perform_search(query, model, index, webpages)
-
-    # 输出结果
-    print("搜索结果：")
-    for i, result in enumerate(results, 1):
-        print(f"{i}. {result}")
+    main(urls)
